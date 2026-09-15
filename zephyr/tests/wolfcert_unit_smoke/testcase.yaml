@@ -1,0 +1,41 @@
+common:
+  tags:
+    - wolfcert
+  harness: console
+  harness_config:
+    type: one_line
+    regex:
+      - "WOLFCERT TEST RESULT: 0"
+tests:
+  wolfcert.unit.smoke:
+    timeout: 180
+    platform_allow: qemu_x86
+    integration_platforms:
+      - qemu_x86
+
+  # Build-only rows for the options the other suites leave at their defaults,
+  # so a combination nobody runs still has to compile.
+  wolfcert.build.no_builtin_transport:
+    build_only: true
+    platform_allow: qemu_x86
+    extra_configs:
+      - CONFIG_WOLFCERT_BUILTIN_TRANSPORT=n
+  wolfcert.build.rsa_only:
+    build_only: true
+    platform_allow: qemu_x86
+    extra_configs:
+      - CONFIG_WOLFCERT_ECC=n
+      - CONFIG_WOLFCERT_ED25519=n
+  wolfcert.build.scep_only_rsa:
+    build_only: true
+    platform_allow: qemu_x86
+    extra_configs:
+      - CONFIG_WOLFCERT_EST=n
+      - CONFIG_WOLFCERT_SCEP=y
+      - CONFIG_WOLFCERT_ECC=n
+      - CONFIG_WOLFCERT_ED25519=n
+  wolfcert.build.posix_store:
+    build_only: true
+    platform_allow: qemu_x86
+    extra_configs:
+      - CONFIG_WOLFCERT_POSIX_STORE=y
