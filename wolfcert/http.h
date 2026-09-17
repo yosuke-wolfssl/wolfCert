@@ -39,7 +39,7 @@ WOLFCERT_API int wolfcert_posix_connect(const char* host, int port,
 #endif
 
 typedef struct {
-    const char* method;            /* "GET" or "POST" */
+    const char* method;            /* "GET", "HEAD" or "POST" */
     const char* url;               /* full URL; scheme http or https */
     const char* content_type;
     const char* content_transfer_encoding;
@@ -73,6 +73,7 @@ typedef struct {
 typedef struct {
     int       status_code;
     char*     content_type;
+    /* May be NULL when body_len is 0; check body_len, not body. */
     uint8_t*  body;
     size_t    body_len;
     /* `Retry-After` header parsed as delta-seconds (RFC 7231 section 7.1.3).

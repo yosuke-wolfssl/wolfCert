@@ -50,6 +50,7 @@
 #endif
 #define WOLFCERT_HTTP_DEFAULT_MAX_BODY  (64 * 1024)
 #define WOLFCERT_HTTP_READ_CHUNK   2048
+#define WOLFCERT_HTTP_MAX_INTERIM  8
 
 /* ASCII-only case folding. Every token compared here (scheme, host, header
  * name, transfer coding) is ASCII by definition, and unlike strcasecmp this
@@ -446,6 +447,8 @@ struct WolfCertHttpSession {
     char*         sm_content_type;     /* taken from headers */
     int           sm_status;
     int           sm_retry_after_sec;   /* delta-seconds; 0 if absent */
+    int           sm_head_request;
+    int           sm_interim;           /* interim 1xx blocks dropped so far */
     WolfCertHttpResponse* sm_resp;     /* caller's resp; written to on DONE */
 };
 
@@ -655,6 +658,20 @@ static int parse_status_line(const char* line, int* out_status)
     *out_status = (int)v;
 
     return WOLFCERT_OK;
+}
+
+/* RFC 9110 section 15.2: a final response follows an interim 1xx on the same
+ * connection. 101 is itself the final response, so it is not interim. */
+static int status_is_interim(int status)
+{
+    return status >= 100 && status < 200 && status != 101;
+}
+
+/* RFC 9112 section 6.3: a response to HEAD, and a 204 or 304, has no body
+ * whatever Content-Length or Transfer-Encoding say. */
+static int response_has_no_body(int status, int head_request)
+{
+    return head_request || status == 204 || status == 304;
 }
 
 static int read_headers(WolfCertConn* c, DynBuf* rx)
@@ -940,11 +957,16 @@ static int read_body(WolfCertConn* c, DynBuf* rx, size_t body_start,
         }
 
         size_t n = (size_t)length;
-        uint8_t* b = (uint8_t*)WOLFCERT_XMALLOC(n, heap);
-        if (b == NULL)
-            return WOLFCERT_ERR_MEMORY;
+        uint8_t* b = NULL;
 
-        memcpy(b, rx->buf + body_start, n);
+        if (n > 0) {
+            b = (uint8_t*)WOLFCERT_XMALLOC(n, heap);
+            if (b == NULL)
+                return WOLFCERT_ERR_MEMORY;
+
+            memcpy(b, rx->buf + body_start, n);
+        }
+
         *out = b;
         *out_len = n;
 
@@ -967,12 +989,15 @@ static int read_body(WolfCertConn* c, DynBuf* rx, size_t body_start,
     }
 
     size_t n = rx->len - body_start;
-    uint8_t* b = (uint8_t*)WOLFCERT_XMALLOC(n ? n : 1, heap);
-    if (b == NULL)
-        return WOLFCERT_ERR_MEMORY;
+    uint8_t* b = NULL;
 
-    if (n > 0)
+    if (n > 0) {
+        b = (uint8_t*)WOLFCERT_XMALLOC(n, heap);
+        if (b == NULL)
+            return WOLFCERT_ERR_MEMORY;
+
         memcpy(b, rx->buf + body_start, n);
+    }
 
     *out = b;
     *out_len = n;
@@ -1261,68 +1286,101 @@ static size_t rx_max(size_t max_body)
 }
 
 static int http_read_response(WolfCertConn* c,
+                              const char* method,
                               size_t max_body,
                               WolfCertHttpResponse* resp,
                               void* heap)
 {
     DynBuf rx = { .heap = heap, .max = rx_max(max_body) };
-    int hdr_end = read_headers(c, &rx);
-    if (hdr_end < 0) {
-        WOLFCERT_XFREE(rx.buf, heap);
-        return hdr_end;
-    }
+    char*  headers_nt = NULL;
+    char*  ct = NULL;
+    char*  ra = NULL;
+    int    head_request = (strcmp(method, "HEAD") == 0);
+    int    retry_after = 0;
+    int    interim = 0;
+    int    hdr_end = 0;
+    int    status = 0;
+    int    rc = WOLFCERT_OK;
 
-    char* headers_nt = (char*)WOLFCERT_XMALLOC((size_t)hdr_end + 1, heap);
-    if (headers_nt == NULL) {
-        WOLFCERT_XFREE(rx.buf, heap);
-        return WOLFCERT_ERR_MEMORY;
-    }
-
-    memcpy(headers_nt, rx.buf, (size_t)hdr_end);
-    headers_nt[hdr_end] = '\0';
-
-    int status = 0;
-    int rc = parse_status_line(headers_nt, &status);
-    if (rc != WOLFCERT_OK) {
-        WOLFCERT_XFREE(headers_nt, heap);
-        WOLFCERT_XFREE(rx.buf, heap);
-        return rc;
-    }
-
-    char* ct = find_header(headers_nt, "Content-Type", heap);
-    /* RFC 7231 section 7.1.3: `Retry-After` carries either delta-seconds or an
-     * HTTP-date. wolfCert parses delta-seconds only; a non-digit first
-     * character (i.e. the HTTP-date form) leaves retry_after_sec at 0. */
-    char* ra = find_header(headers_nt, "Retry-After", heap);
-    int   retry_after = 0;
-
-    if (ra != NULL) {
-        const char* p = ra;
-        while (*p == ' ' || *p == '\t')
-            ++p;
-
-        if (*p >= '0' && *p <= '9') {
-            long v = strtol(p, NULL, 10);
-            if (v > 0 && v <= 86400)
-                retry_after = (int)v;
+    for (;;) {
+        hdr_end = read_headers(c, &rx);
+        if (hdr_end < 0) {
+            rc = hdr_end;
+            break;
         }
-        WOLFCERT_XFREE(ra, heap);
-    }
-    rc = read_body(c, &rx, (size_t)hdr_end, headers_nt,
-                   &resp->body, &resp->body_len, max_body, heap);
 
+        WOLFCERT_XFREE(headers_nt, heap);
+        headers_nt = (char*)WOLFCERT_XMALLOC((size_t)hdr_end + 1, heap);
+        if (headers_nt == NULL) {
+            rc = WOLFCERT_ERR_MEMORY;
+            break;
+        }
+
+        memcpy(headers_nt, rx.buf, (size_t)hdr_end);
+        headers_nt[hdr_end] = '\0';
+
+        rc = parse_status_line(headers_nt, &status);
+        if (rc != WOLFCERT_OK)
+            break;
+
+        if (status == 101) {
+            rc = WOLFCERT_ERR(WOLFCERT_ERR_PROTOCOL, "http",
+                "http: server sent 101 Switching Protocols, which wolfCert "
+                "never asks for with an Upgrade header");
+            break;
+        }
+
+        if (!status_is_interim(status))
+            break;
+
+        if (++interim > WOLFCERT_HTTP_MAX_INTERIM) {
+            rc = WOLFCERT_ERR(WOLFCERT_ERR_PROTOCOL, "http",
+                "http: more than %d interim 1xx responses arrived before a "
+                "final one", WOLFCERT_HTTP_MAX_INTERIM);
+            break;
+        }
+
+        /* Drop the interim block. */
+        memmove(rx.buf, rx.buf + hdr_end, rx.len - (size_t)hdr_end);
+        rx.len -= (size_t)hdr_end;
+    }
+
+    if (rc == WOLFCERT_OK) {
+        ct = find_header(headers_nt, "Content-Type", heap);
+        /* RFC 7231 section 7.1.3: `Retry-After` carries either delta-seconds
+         * or an HTTP-date. wolfCert parses delta-seconds only. */
+        ra = find_header(headers_nt, "Retry-After", heap);
+        if (ra != NULL) {
+            const char* p = ra;
+            while (*p == ' ' || *p == '\t')
+                ++p;
+
+            if (*p >= '0' && *p <= '9') {
+                long v = strtol(p, NULL, 10);
+                if (v > 0 && v <= 86400)
+                    retry_after = (int)v;
+            }
+            WOLFCERT_XFREE(ra, heap);
+        }
+
+        if (!response_has_no_body(status, head_request)) {
+            rc = read_body(c, &rx, (size_t)hdr_end, headers_nt,
+                           &resp->body, &resp->body_len, max_body, heap);
+        }
+    }
+
+    if (rc == WOLFCERT_OK) {
+        resp->status_code     = status;
+        resp->content_type    = ct;
+        resp->retry_after_sec = retry_after;
+        ct = NULL;  /* ownership moved */
+    }
+
+    WOLFCERT_XFREE(ct,         heap);
     WOLFCERT_XFREE(headers_nt, heap);
-    WOLFCERT_XFREE(rx.buf, heap);
-    if (rc != WOLFCERT_OK) {
-        WOLFCERT_XFREE(ct, heap);
-        return rc;
-    }
+    WOLFCERT_XFREE(rx.buf,     heap);
 
-    resp->status_code     = status;
-    resp->content_type    = ct;
-    resp->retry_after_sec = retry_after;
-
-    return WOLFCERT_OK;
+    return rc;
 }
 
 /* ---- main --------------------------------------------------------------- */
@@ -1381,7 +1439,7 @@ int wolfcert_http_request(const WolfCertHttpRequest* req, WolfCertHttpResponse* 
     if (rc != WOLFCERT_OK)
         goto out;
 
-    rc = http_read_response(&c, max_body, resp, heap);
+    rc = http_read_response(&c, req->method, max_body, resp, heap);
 
 out:
     if (c.ssl) {
@@ -1517,7 +1575,8 @@ int wolfcert_http_session_request(WolfCertHttpSession* s,
         return rc;
     }
 
-    rc = http_read_response(&s->conn, s->max_body, resp, s->heap);
+    rc = http_read_response(&s->conn, req->method, s->max_body, resp,
+                            s->heap);
     wolfcert_http_url_free(&u);
     if (rc != WOLFCERT_OK)
         s->closed = 1;
@@ -1555,6 +1614,8 @@ static void sm_reset(WolfCertHttpSession* s)
     s->sm_status = 0;
     s->sm_resp = NULL;
     s->sm_retry_after_sec = 0;
+    s->sm_head_request = 0;
+    s->sm_interim = 0;
 }
 
 /* Tear-down shortcut for state-machine error returns: drop per-request
@@ -1836,23 +1897,40 @@ static int inspect_headers(WolfCertHttpSession* s)
     }
     s->sm_status = status;
 
-    char* te = find_header(hdrs, "Transfer-Encoding", s->heap);
-    if (te != NULL && ci_cmp(te, "chunked") == 0) {
-        WOLFCERT_XFREE(te, s->heap);
+    if (status == 101) {
         WOLFCERT_XFREE(hdrs, s->heap);
-        return WOLFCERT_ERR(WOLFCERT_ERR_UNSUPPORTED, "http",
-            "async session: Transfer-Encoding: chunked not supported "
-            "(use the blocking wolfcert_http_session_request instead)");
+        return WOLFCERT_ERR(WOLFCERT_ERR_PROTOCOL, "http",
+            "http: server sent 101 Switching Protocols, which wolfCert "
+            "never asks for with an Upgrade header");
     }
-    WOLFCERT_XFREE(te, s->heap);
 
-    char* cl = find_header(hdrs, "Content-Length", s->heap);
-    s->sm_content_length = (cl != NULL) ? strtol(cl, NULL, 10) : -1;
-    WOLFCERT_XFREE(cl, s->heap);
-    if (s->sm_content_length >= 0 &&
-        (size_t)s->sm_content_length > s->max_body) {
+    if (status_is_interim(status)) {
         WOLFCERT_XFREE(hdrs, s->heap);
-        return WOLFCERT_ERR_PROTOCOL;
+        return WOLFCERT_OK;
+    }
+
+    if (response_has_no_body(status, s->sm_head_request)) {
+        s->sm_content_length = 0;
+    }
+    else {
+        char* te = find_header(hdrs, "Transfer-Encoding", s->heap);
+        if (te != NULL && ci_cmp(te, "chunked") == 0) {
+            WOLFCERT_XFREE(te, s->heap);
+            WOLFCERT_XFREE(hdrs, s->heap);
+            return WOLFCERT_ERR(WOLFCERT_ERR_UNSUPPORTED, "http",
+                "async session: Transfer-Encoding: chunked not supported "
+                "(use the blocking wolfcert_http_session_request instead)");
+        }
+        WOLFCERT_XFREE(te, s->heap);
+
+        char* cl = find_header(hdrs, "Content-Length", s->heap);
+        s->sm_content_length = (cl != NULL) ? strtol(cl, NULL, 10) : -1;
+        WOLFCERT_XFREE(cl, s->heap);
+        if (s->sm_content_length >= 0 &&
+            (size_t)s->sm_content_length > s->max_body) {
+            WOLFCERT_XFREE(hdrs, s->heap);
+            return WOLFCERT_ERR_PROTOCOL;
+        }
     }
 
     s->sm_content_type = find_header(hdrs, "Content-Type", s->heap);
@@ -1949,6 +2027,9 @@ int wolfcert_http_session_request_nb(WolfCertHttpSession* s,
         s->sm_body_len = req->body_len;
         s->sm_body_off = 0;
 
+        s->sm_head_request = (strcmp(req->method, "HEAD") == 0);
+        s->sm_interim      = 0;
+
         /* Seed rx with any residual bytes from the previous response. */
         if (s->residual_len > 0) {
             int rr = nb_rx_reserve(s, s->residual_len);
@@ -2025,6 +2106,23 @@ int wolfcert_http_session_request_nb(WolfCertHttpSession* s,
                         int rc = inspect_headers(s);
                         if (rc != WOLFCERT_OK)
                             return sm_fail(s, rc);
+
+                        if (status_is_interim(s->sm_status)) {
+                            if (++s->sm_interim > WOLFCERT_HTTP_MAX_INTERIM) {
+                                return sm_fail(s, WOLFCERT_ERR(
+                                    WOLFCERT_ERR_PROTOCOL, "http",
+                                    "http: more than %d interim 1xx responses "
+                                    "arrived before a final one",
+                                    WOLFCERT_HTTP_MAX_INTERIM));
+                            }
+
+                            /* Drop the interim block. */
+                            memmove(s->sm_rx, s->sm_rx + s->sm_hdr_end,
+                                    s->sm_rx_len - s->sm_hdr_end);
+                            s->sm_rx_len -= s->sm_hdr_end;
+                            s->sm_hdr_end = 0;
+                            goto state_loop_continue;
+                        }
 
                         s->sm_state = (s->sm_content_length >= 0)
                                     ? SM_READ_BODY_CL : SM_READ_BODY_EOF;

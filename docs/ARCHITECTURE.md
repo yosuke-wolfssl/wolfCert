@@ -434,7 +434,9 @@ The contract:
 - **`read` / `write` return a positive byte count**, or a negative
   `WOLFCERT_ERR_*`. Never `0`: an orderly peer close is
   `WOLFCERT_ERR_CONN_CLOSED`, which is what terminates a response body that
-  has neither `Content-Length` nor chunking.
+  has neither `Content-Length` nor chunking. A response to `HEAD`, and a
+  `204` or `304`, has no body at all (RFC 9112 section 6.3) and ends at the
+  header block, so no read follows it.
 - **`connect`'s `timeout_ms` is the caller's**, passed through from
   `WolfCertServerCfg.timeout_ms` / `WolfCertHttpRequest.timeout_ms`. A value
   above zero bounds the whole connect attempt. Zero or less imposes no limit
